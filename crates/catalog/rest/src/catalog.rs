@@ -77,7 +77,7 @@ pub const REST_CATALOG_PROP_AUTH_TYPE: &str = "rest.auth.type";
 /// to 100; 0 disables the cache). The cache is keyed by session id, so it only
 /// helps callers that reuse a [`SessionContext`], and a table changed through
 /// this catalog is invalidated only for the session that changed it. Loads that
-/// vend short-lived storage credentials are never cached.
+/// vend short-lived storage credentials or use S3 remote signing are never cached.
 pub const REST_CATALOG_PROP_TABLE_CACHE_MAX_ENTRIES: &str = "rest-table-cache.max-entries";
 /// How long a loaded table stays cached for freshness-aware loading, in
 /// milliseconds (defaults to 5 minutes; must be positive and at most 1000 years).
@@ -90,14 +90,20 @@ const TABLE_CACHE_EXPIRE_AFTER_WRITE_MS_DEFAULT: u64 = 5 * 60 * 1000;
 const TABLE_CACHE_EXPIRE_AFTER_WRITE_MAX: Duration = Duration::from_secs(1000 * 365 * 24 * 3600);
 
 /// Tables loaded with an `ETag`, keyed by session id and identifier. Loads that
-/// vend short-lived storage credentials are not cached, since a `304` cannot
-/// refresh them.
+/// vend short-lived storage credentials or hold an S3 remote signer's bearer
+/// token are not cached, since a `304` cannot refresh them.
 type TableCache = moka::sync::Cache<(String, TableIdent), (String, Table)>;
 
 /// Whether a `loadTable` config key carries a short-lived storage credential.
 fn is_short_lived_credential(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
     key == S3_SESSION_TOKEN || key == GCS_TOKEN || key.starts_with(ADLS_SAS_TOKEN)
+}
+
+fn remote_signing_enabled(props: &HashMap<String, String>) -> bool {
+    props
+        .get(S3_REMOTE_SIGNING_ENABLED)
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"))
 }
 
 const ICEBERG_REST_SPEC_VERSION: &str = "0.14.1";
@@ -1002,9 +1008,7 @@ impl RestSessionCatalog {
         }
         // The S3 remote signer authenticates with the session's current token, which may
         // have been obtained from a `credential` rather than configured directly.
-        if props
-            .get(S3_REMOTE_SIGNING_ENABLED)
-            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+        if remote_signing_enabled(&props)
             && let Some(token) = client.token(session).await
         {
             props.insert("token".to_string(), token);
@@ -1457,11 +1461,12 @@ impl SessionCatalog for RestSessionCatalog {
                 .keys()
                 .any(|key| is_short_lived_credential(key));
 
-        let config = response
+        let config: HashMap<_, _> = response
             .config
             .into_iter()
             .chain(self.user_config.props.clone())
             .collect();
+        let cacheable = !vends_credentials && !remote_signing_enabled(&config);
 
         let file_io = self
             .load_file_io(
@@ -1490,7 +1495,7 @@ impl SessionCatalog for RestSessionCatalog {
         // the next load's `If-None-Match` check replaces it.
         if let Some((cache, key)) = cache {
             match etag {
-                Some(etag) if !vends_credentials => cache.insert(key, (etag, table.clone())),
+                Some(etag) if cacheable => cache.insert(key, (etag, table.clone())),
                 _ => cache.invalidate(&key),
             }
         }
@@ -4802,6 +4807,34 @@ mod tests {
             .load_table(&context, &test_table_ident())
             .await
             .unwrap();
+
+        load.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_load_table_with_remote_signing_is_not_cached() {
+        let mut server = Server::new_async().await;
+        let _config = create_config_mock(&mut server).await;
+        let mut body = load_table_body("v1");
+        body["config"] = json!({ S3_REMOTE_SIGNING_ENABLED: "true" });
+        let load = server
+            .mock("GET", "/v1/namespaces/ns1/tables/test1")
+            .match_header("if-none-match", Matcher::Missing)
+            .with_status(200)
+            .with_header("etag", "\"v1\"")
+            .with_body(body.to_string())
+            .expect(2)
+            .create_async()
+            .await;
+        let catalog = session_catalog(RestCatalogConfig::builder().uri(server.url()).build());
+        let context = SessionContext::empty();
+
+        for _ in 0..2 {
+            catalog
+                .load_table(&context, &test_table_ident())
+                .await
+                .unwrap();
+        }
 
         load.assert_async().await;
     }
