@@ -75,6 +75,12 @@ pub const S3_DISABLE_CONFIG_LOAD: &str = "s3.disable-config-load";
 ///
 /// Only `iceberg-storage-opendal` reads this property, so [`S3Config`] has no matching field.
 pub const S3_MULTIPART_PART_SIZE_BYTES: &str = "s3.multipart.part-size-bytes";
+/// Sign S3 requests via the Iceberg REST remote signing endpoint instead of locally.
+pub const S3_REMOTE_SIGNING_ENABLED: &str = "s3.remote-signing-enabled";
+/// Base URI of the remote signer. Defaults to the catalog `uri`.
+pub const S3_SIGNER_URI: &str = "s3.signer.uri";
+/// Path of the remote signing endpoint, relative to [`S3_SIGNER_URI`].
+pub const S3_SIGNER_ENDPOINT: &str = "s3.signer.endpoint";
 
 /// Amazon S3 storage configuration.
 ///

@@ -1118,8 +1118,11 @@ pub const iceberg::io::S3_ENDPOINT: &str
 pub const iceberg::io::S3_MULTIPART_PART_SIZE_BYTES: &str
 pub const iceberg::io::S3_PATH_STYLE_ACCESS: &str
 pub const iceberg::io::S3_REGION: &str
+pub const iceberg::io::S3_REMOTE_SIGNING_ENABLED: &str
 pub const iceberg::io::S3_SECRET_ACCESS_KEY: &str
 pub const iceberg::io::S3_SESSION_TOKEN: &str
+pub const iceberg::io::S3_SIGNER_ENDPOINT: &str
+pub const iceberg::io::S3_SIGNER_URI: &str
 pub const iceberg::io::S3_SSE_KEY: &str
 pub const iceberg::io::S3_SSE_MD5: &str
 pub const iceberg::io::S3_SSE_TYPE: &str

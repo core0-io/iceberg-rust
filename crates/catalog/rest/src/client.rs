@@ -115,11 +115,10 @@ impl HttpClient {
         })
     }
 
-    /// Testing only: the bearer token `session` would attach.
+    /// The bearer token `session` would attach, if any.
     ///
     /// Authenticates a throwaway request (never sent) and reads the header
     /// back, so it works for any [`AuthSession`].
-    #[cfg(test)]
     pub(crate) async fn token(&self, auth_session: &dyn AuthSession) -> Option<String> {
         let mut request = HttpRequest::build(
             self.client

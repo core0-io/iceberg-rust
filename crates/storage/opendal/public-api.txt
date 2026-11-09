@@ -25,6 +25,7 @@ pub iceberg_storage_opendal::OpenDalStorage::S3::client_config: iceberg_storage_
 pub iceberg_storage_opendal::OpenDalStorage::S3::config: alloc::sync::Arc<opendal_service_s3::config::S3Config>
 pub iceberg_storage_opendal::OpenDalStorage::S3::customized_credential_load: core::option::Option<iceberg_storage_opendal::CustomAwsCredentialLoader>
 pub iceberg_storage_opendal::OpenDalStorage::S3::multipart_part_size: u64
+pub iceberg_storage_opendal::OpenDalStorage::S3::remote_signing: core::option::Option<iceberg_storage_opendal::S3RemoteSigning>
 impl core::clone::Clone for iceberg_storage_opendal::OpenDalStorage
 pub fn iceberg_storage_opendal::OpenDalStorage::clone(&self) -> iceberg_storage_opendal::OpenDalStorage
 impl core::fmt::Debug for iceberg_storage_opendal::OpenDalStorage
@@ -129,4 +130,13 @@ impl serde_core::ser::Serialize for iceberg_storage_opendal::OpenDalResolvingSto
 pub fn iceberg_storage_opendal::OpenDalResolvingStorageFactory::serialize<__S>(&self, __serializer: __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
 impl<'de> serde_core::de::Deserialize<'de> for iceberg_storage_opendal::OpenDalResolvingStorageFactory
 pub fn iceberg_storage_opendal::OpenDalResolvingStorageFactory::deserialize<__D>(__deserializer: __D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+pub struct iceberg_storage_opendal::S3RemoteSigning
+impl core::clone::Clone for iceberg_storage_opendal::S3RemoteSigning
+pub fn iceberg_storage_opendal::S3RemoteSigning::clone(&self) -> iceberg_storage_opendal::S3RemoteSigning
+impl core::fmt::Debug for iceberg_storage_opendal::S3RemoteSigning
+pub fn iceberg_storage_opendal::S3RemoteSigning::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for iceberg_storage_opendal::S3RemoteSigning
+pub fn iceberg_storage_opendal::S3RemoteSigning::serialize<__S>(&self, __serializer: __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for iceberg_storage_opendal::S3RemoteSigning
+pub fn iceberg_storage_opendal::S3RemoteSigning::deserialize<__D>(__deserializer: __D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 pub const iceberg_storage_opendal::OPENDAL_IO_TIMEOUT_MS: &str

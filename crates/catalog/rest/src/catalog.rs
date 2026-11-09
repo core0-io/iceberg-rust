@@ -28,7 +28,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use iceberg::encryption::kms::{KeyManagementClient, KmsClientFactory};
 use iceberg::io::{
-    ADLS_SAS_TOKEN, FileIO, FileIOBuilder, GCS_TOKEN, S3_SESSION_TOKEN, StorageFactory,
+    ADLS_SAS_TOKEN, FileIO, FileIOBuilder, GCS_TOKEN, S3_REMOTE_SIGNING_ENABLED, S3_SESSION_TOKEN,
+    StorageFactory,
 };
 use iceberg::table::Table;
 use iceberg::{
@@ -598,10 +599,16 @@ impl RestCatalogClient {
         }
     }
 
-    /// Testing only: the bearer token the catalog session would attach.
-    #[cfg(test)]
-    async fn token(&self) -> Option<String> {
-        self.http_client.token(self.catalog_session.as_ref()).await
+    /// The authentication session derived for `context`.
+    async fn session(&self, context: &SessionContext) -> Result<Arc<dyn AuthSession>> {
+        self.auth_manager
+            .contextual_session(context, Arc::clone(&self.catalog_session))
+            .await
+    }
+
+    /// The bearer token `session` would attach, if any.
+    async fn token(&self, session: &dyn AuthSession) -> Option<String> {
+        self.http_client.token(session).await
     }
 
     /// Sends `request` with the authentication derived for `context`.
@@ -610,10 +617,7 @@ impl RestCatalogClient {
         context: &SessionContext,
         request: HttpRequest,
     ) -> Result<HttpResponse> {
-        let session = self
-            .auth_manager
-            .contextual_session(context, Arc::clone(&self.catalog_session))
-            .await?;
+        let session = self.session(context).await?;
         self.http_client
             .query_catalog(session.as_ref(), request)
             .await
@@ -985,12 +989,25 @@ impl RestSessionCatalog {
 
     async fn load_file_io(
         &self,
+        session: &dyn AuthSession,
         metadata_location: Option<&str>,
         extra_config: Option<HashMap<String, String>>,
     ) -> Result<FileIO> {
-        let mut props = self.client().await?.config.props.clone();
+        let client = self.client().await?;
+        let mut props = client.config.props.clone();
+        // The S3 remote signer falls back to the catalog URI.
+        props.insert(REST_CATALOG_PROP_URI.to_string(), client.config.uri.clone());
         if let Some(config) = extra_config {
             props.extend(config);
+        }
+        // The S3 remote signer authenticates with the session's current token, which may
+        // have been obtained from a `credential` rather than configured directly.
+        if props
+            .get(S3_REMOTE_SIGNING_ENABLED)
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+            && let Some(token) = client.token(session).await
+        {
+            props.insert("token".to_string(), token);
         }
 
         // If the warehouse is a logical identifier instead of a URL we don't want
@@ -1306,7 +1323,11 @@ impl SessionCatalog for RestSessionCatalog {
                 }),
         )?;
 
-        let http_response = client.query_catalog(context, request).await?;
+        let session = client.session(context).await?;
+        let http_response = client
+            .http_client
+            .query_catalog(session.as_ref(), request)
+            .await?;
 
         let response = match http_response.status() {
             StatusCode::OK => deserialize_catalog_response::<LoadTableResult>(http_response)?,
@@ -1342,7 +1363,7 @@ impl SessionCatalog for RestSessionCatalog {
             .collect();
 
         let file_io = self
-            .load_file_io(Some(metadata_location), Some(config))
+            .load_file_io(session.as_ref(), Some(metadata_location), Some(config))
             .await?;
 
         let mut table_builder = Table::builder()
@@ -1386,7 +1407,11 @@ impl SessionCatalog for RestSessionCatalog {
         }
         let request = HttpRequest::build(request_builder)?;
 
-        let http_response = client.query_catalog(context, request).await?;
+        let session = client.session(context).await?;
+        let http_response = client
+            .http_client
+            .query_catalog(session.as_ref(), request)
+            .await?;
 
         let (response, etag) = match http_response.status() {
             StatusCode::OK => {
@@ -1439,7 +1464,11 @@ impl SessionCatalog for RestSessionCatalog {
             .collect();
 
         let file_io = self
-            .load_file_io(response.metadata_location.as_deref(), Some(config))
+            .load_file_io(
+                session.as_ref(),
+                response.metadata_location.as_deref(),
+                Some(config),
+            )
             .await?;
 
         let mut table_builder = Table::builder()
@@ -1561,7 +1590,11 @@ impl SessionCatalog for RestSessionCatalog {
         )?;
 
         client.invalidate_table(context, table_ident);
-        let http_response = client.query_catalog(context, request).await?;
+        let session = client.session(context).await?;
+        let http_response = client
+            .http_client
+            .query_catalog(session.as_ref(), request)
+            .await?;
 
         let response: LoadTableResult = match http_response.status() {
             StatusCode::OK => deserialize_catalog_response::<LoadTableResult>(http_response)?,
@@ -1590,7 +1623,9 @@ impl SessionCatalog for RestSessionCatalog {
             "Metadata location missing in `register_table` response!",
         ))?;
 
-        let file_io = self.load_file_io(Some(metadata_location), None).await?;
+        let file_io = self
+            .load_file_io(session.as_ref(), Some(metadata_location), None)
+            .await?;
 
         let mut table_builder = Table::builder()
             .identifier(table_ident.clone())
@@ -1626,7 +1661,11 @@ impl SessionCatalog for RestSessionCatalog {
         )?;
 
         client.invalidate_table(context, commit.identifier());
-        let http_response = client.query_catalog(context, request).await?;
+        let session = client.session(context).await?;
+        let http_response = client
+            .http_client
+            .query_catalog(session.as_ref(), request)
+            .await?;
 
         let response: CommitTableResponse = match http_response.status() {
             StatusCode::OK => deserialize_catalog_response(http_response)?,
@@ -1670,7 +1709,7 @@ impl SessionCatalog for RestSessionCatalog {
         };
 
         let file_io = self
-            .load_file_io(Some(&response.metadata_location), None)
+            .load_file_io(session.as_ref(), Some(&response.metadata_location), None)
             .await?;
 
         let mut table_builder = Table::builder()
@@ -2515,7 +2554,9 @@ mod tests {
                 .build(),
         );
 
-        let token = catalog.client().await.unwrap().token().await;
+        let client = catalog.client().await.unwrap();
+        let session = client.session(&SessionContext::empty()).await.unwrap();
+        let token = client.token(session.as_ref()).await;
         oauth_mock.assert_async().await;
         config_mock.assert_async().await;
         assert_eq!(token, Some("ey000000000000".to_string()));
@@ -2557,7 +2598,9 @@ mod tests {
                 .build(),
         );
 
-        let token = catalog.client().await.unwrap().token().await;
+        let client = catalog.client().await.unwrap();
+        let session = client.session(&SessionContext::empty()).await.unwrap();
+        let token = client.token(session.as_ref()).await;
 
         oauth_mock.assert_async().await;
         config_mock.assert_async().await;
@@ -2659,7 +2702,9 @@ mod tests {
                 .build(),
         );
 
-        let token = catalog.client().await.unwrap().token().await;
+        let client = catalog.client().await.unwrap();
+        let session = client.session(&SessionContext::empty()).await.unwrap();
+        let token = client.token(session.as_ref()).await;
 
         oauth_mock.assert_async().await;
         config_mock.assert_async().await;
@@ -4815,6 +4860,72 @@ mod tests {
         catalog.load_table(&context, &ident).await.unwrap();
 
         load.assert_async().await;
+    }
+
+    async fn load_table_file_io_props_with_oauth(
+        remote_signing: bool,
+    ) -> (String, HashMap<String, String>) {
+        let mut server = Server::new_async().await;
+        let oauth_mock = create_oauth_mock(&mut server).await;
+        let config_mock = create_config_mock(&mut server).await;
+        let mut body: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(format!(
+                "{}/testdata/load_table_response.json",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        if remote_signing {
+            body["config"][S3_REMOTE_SIGNING_ENABLED] = "true".into();
+        }
+        let load_table_mock = server
+            .mock("GET", "/v1/namespaces/ns1/tables/test1")
+            .match_header("authorization", "Bearer ey000000000000")
+            .with_status(200)
+            .with_body(body.to_string())
+            .create_async()
+            .await;
+
+        let catalog = session_catalog(
+            RestCatalogConfig::builder()
+                .uri(server.url())
+                .props(HashMap::from([(
+                    "credential".to_string(),
+                    "client1:secret1".to_string(),
+                )]))
+                .build(),
+        );
+        let table = catalog
+            .load_table(
+                &SessionContext::empty(),
+                &TableIdent::new(NamespaceIdent::new("ns1".to_string()), "test1".to_string()),
+            )
+            .await
+            .unwrap();
+
+        oauth_mock.assert_async().await;
+        config_mock.assert_async().await;
+        load_table_mock.assert_async().await;
+        (server.url(), table.file_io().config().props().clone())
+    }
+
+    #[tokio::test]
+    async fn test_load_table_remote_signing_file_io_carries_session_token() {
+        let (url, props) = load_table_file_io_props_with_oauth(true).await;
+
+        assert_eq!(
+            props.get("token").map(String::as_str),
+            Some("ey000000000000")
+        );
+        assert_eq!(props.get(REST_CATALOG_PROP_URI), Some(&url));
+    }
+
+    #[tokio::test]
+    async fn test_load_table_file_io_omits_session_token_without_remote_signing() {
+        let (_, props) = load_table_file_io_props_with_oauth(false).await;
+
+        assert_eq!(props.get("token"), None);
     }
 
     #[tokio::test]

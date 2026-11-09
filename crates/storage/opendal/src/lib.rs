@@ -238,12 +238,16 @@ impl StorageFactory for OpenDalStorageFactory {
             #[cfg(feature = "opendal-s3")]
             OpenDalStorageFactory::S3 {
                 customized_credential_load,
-            } => Ok(Arc::new(OpenDalStorage::S3 {
-                config: s3_config_parse(config.props().clone())?.into(),
-                multipart_part_size: s3_multipart_part_size_parse(config.props())?,
-                customized_credential_load: customized_credential_load.clone(),
-                client_config,
-            })),
+            } => {
+                let (s3_config, remote_signing) = s3_config_parse(config.props().clone())?;
+                Ok(Arc::new(OpenDalStorage::S3 {
+                    config: s3_config.into(),
+                    multipart_part_size: s3_multipart_part_size_parse(config.props())?,
+                    remote_signing,
+                    customized_credential_load: customized_credential_load.clone(),
+                    client_config,
+                }))
+            }
             #[cfg(feature = "opendal-gcs")]
             OpenDalStorageFactory::Gcs => Ok(Arc::new(OpenDalStorage::Gcs {
                 config: gcs_config_parse(config.props().clone())?.into(),
@@ -335,6 +339,9 @@ pub enum OpenDalStorage {
         /// Backend-independent client settings.
         #[serde(default)]
         client_config: OpenDalClientConfig,
+        /// Iceberg REST remote signing, which takes precedence over local signing.
+        #[serde(default)]
+        remote_signing: Option<S3RemoteSigning>,
     },
     /// GCS storage variant.
     #[cfg(feature = "opendal-gcs")]
@@ -427,9 +434,10 @@ impl OpenDalStorage {
             OpenDalStorage::S3 {
                 config,
                 customized_credential_load,
+                remote_signing,
                 ..
             } => {
-                let op = s3_config_build(config, customized_credential_load, path)?;
+                let op = s3_config_build(config, customized_credential_load, remote_signing, path)?;
                 let op_info = op.info();
 
                 // Use the URL scheme in the path for prefix matching. This enables
@@ -933,6 +941,7 @@ mod tests {
         let storage = OpenDalStorage::S3 {
             config: Arc::new(S3Config::default()),
             multipart_part_size: default_multipart_part_size(),
+            remote_signing: None,
             customized_credential_load: None,
             client_config: client_config("45000").unwrap(),
         };
@@ -1150,6 +1159,7 @@ mod tests {
         let storage = OpenDalStorage::S3 {
             config: Arc::new(S3Config::default()),
             multipart_part_size: default_multipart_part_size(),
+            remote_signing: None,
             customized_credential_load: None,
             client_config: OpenDalClientConfig::default(),
         };

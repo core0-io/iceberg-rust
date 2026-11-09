@@ -92,10 +92,11 @@ fn build_storage_for_scheme(
     match scheme {
         #[cfg(feature = "opendal-s3")]
         "s3" => {
-            let config = crate::s3::s3_config_parse(props.clone())?;
+            let (config, remote_signing) = crate::s3::s3_config_parse(props.clone())?;
             Ok(OpenDalStorage::S3 {
                 config: Arc::new(config),
                 multipart_part_size: crate::s3::s3_multipart_part_size_parse(props)?,
+                remote_signing,
                 customized_credential_load: customized_credential_load.clone(),
                 client_config,
             })
