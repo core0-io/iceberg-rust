@@ -241,9 +241,10 @@ pub(crate) fn s3_config_build(
     if let Some(remote_signing) = remote_signing {
         let builder = builder.skip_signature().region(&remote_signing.region);
         let op = Operator::new(builder).map_err(from_opendal_error)?;
+        let inner = op.context().http_transport().clone();
         let transport = RemoteSigningTransport {
-            signer: remote_signing.signer(op.context().http_transport().clone()),
-            inner: op.context().http_transport().clone(),
+            signer: remote_signing.signer(inner.clone()),
+            inner,
         };
         let ctx = op
             .context()

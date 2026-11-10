@@ -103,7 +103,7 @@ fn is_short_lived_credential(key: &str) -> bool {
 fn remote_signing_enabled(props: &HashMap<String, String>) -> bool {
     props
         .get(S3_REMOTE_SIGNING_ENABLED)
-        .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+        .is_some_and(|v| ["true", "t", "1", "on"].contains(&v.to_lowercase().as_str()))
 }
 
 const ICEBERG_REST_SPEC_VERSION: &str = "0.14.1";
@@ -623,10 +623,21 @@ impl RestCatalogClient {
         context: &SessionContext,
         request: HttpRequest,
     ) -> Result<HttpResponse> {
+        Ok(self.query_catalog_with_session(context, request).await?.1)
+    }
+
+    /// Like [`Self::query_catalog`], also returning the session used.
+    async fn query_catalog_with_session(
+        &self,
+        context: &SessionContext,
+        request: HttpRequest,
+    ) -> Result<(Arc<dyn AuthSession>, HttpResponse)> {
         let session = self.session(context).await?;
-        self.http_client
+        let response = self
+            .http_client
             .query_catalog(session.as_ref(), request)
-            .await
+            .await?;
+        Ok((session, response))
     }
 
     /// The properties handed to the [`AuthManager`], with the catalog `uri`
@@ -1327,11 +1338,7 @@ impl SessionCatalog for RestSessionCatalog {
                 }),
         )?;
 
-        let session = client.session(context).await?;
-        let http_response = client
-            .http_client
-            .query_catalog(session.as_ref(), request)
-            .await?;
+        let (session, http_response) = client.query_catalog_with_session(context, request).await?;
 
         let response = match http_response.status() {
             StatusCode::OK => deserialize_catalog_response::<LoadTableResult>(http_response)?,
@@ -1411,11 +1418,7 @@ impl SessionCatalog for RestSessionCatalog {
         }
         let request = HttpRequest::build(request_builder)?;
 
-        let session = client.session(context).await?;
-        let http_response = client
-            .http_client
-            .query_catalog(session.as_ref(), request)
-            .await?;
+        let (session, http_response) = client.query_catalog_with_session(context, request).await?;
 
         let (response, etag) = match http_response.status() {
             StatusCode::OK => {
@@ -1595,11 +1598,7 @@ impl SessionCatalog for RestSessionCatalog {
         )?;
 
         client.invalidate_table(context, table_ident);
-        let session = client.session(context).await?;
-        let http_response = client
-            .http_client
-            .query_catalog(session.as_ref(), request)
-            .await?;
+        let (session, http_response) = client.query_catalog_with_session(context, request).await?;
 
         let response: LoadTableResult = match http_response.status() {
             StatusCode::OK => deserialize_catalog_response::<LoadTableResult>(http_response)?,
@@ -1666,11 +1665,7 @@ impl SessionCatalog for RestSessionCatalog {
         )?;
 
         client.invalidate_table(context, commit.identifier());
-        let session = client.session(context).await?;
-        let http_response = client
-            .http_client
-            .query_catalog(session.as_ref(), request)
-            .await?;
+        let (session, http_response) = client.query_catalog_with_session(context, request).await?;
 
         let response: CommitTableResponse = match http_response.status() {
             StatusCode::OK => deserialize_catalog_response(http_response)?,
