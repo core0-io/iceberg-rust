@@ -90,8 +90,9 @@ const TABLE_CACHE_EXPIRE_AFTER_WRITE_MS_DEFAULT: u64 = 5 * 60 * 1000;
 const TABLE_CACHE_EXPIRE_AFTER_WRITE_MAX: Duration = Duration::from_secs(1000 * 365 * 24 * 3600);
 
 /// Tables loaded with an `ETag`, keyed by session id and identifier. Loads that
-/// vend short-lived storage credentials or hold an S3 remote signer's bearer
-/// token are not cached, since a `304` cannot refresh them.
+/// vend short-lived storage credentials or enable S3 remote signing (whose file
+/// IO carries the session's bearer token) are not cached, since a `304` cannot
+/// refresh them.
 type TableCache = moka::sync::Cache<(String, TableIdent), (String, Table)>;
 
 /// Whether a `loadTable` config key carries a short-lived storage credential.
