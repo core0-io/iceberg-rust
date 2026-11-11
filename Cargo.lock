@@ -3160,6 +3160,7 @@ dependencies = [
  "iceberg-property-macro",
  "iceberg_test_utils",
  "mockito",
+ "moka",
  "opendal",
  "reqsign-aws-v4",
  "reqsign-core",

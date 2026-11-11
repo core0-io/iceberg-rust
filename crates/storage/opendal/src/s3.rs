@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroU64;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -352,11 +352,31 @@ struct S3SignRequest<'a> {
     headers: HashMap<&'a str, Vec<&'a str>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct S3SignResponse {
     uri: String,
     headers: HashMap<String, Vec<String>>,
 }
+
+impl S3SignResponse {
+    /// The signer marks a response as reusable with `Cache-Control: private`.
+    fn is_cacheable(&self) -> bool {
+        self.headers.iter().any(|(name, values)| {
+            name.eq_ignore_ascii_case("cache-control") && values.iter().any(|v| v == "private")
+        })
+    }
+}
+
+/// Signer responses shared by all storages, keyed like the Java client's signed component
+/// cache: the request headers are deliberately not part of the key.
+static SIGNED_RESPONSES: LazyLock<
+    moka::sync::Cache<(String, String, String, String), S3SignResponse>,
+> = LazyLock::new(|| {
+    moka::sync::Cache::builder()
+        .time_to_live(Duration::from_secs(30))
+        .max_capacity(100)
+        .build()
+});
 
 fn invalid_sign_response(e: impl Into<anyhow::Error>) -> reqsign_core::Error {
     reqsign_core::Error::unexpected("invalid S3 sign response").with_source(e)
@@ -376,6 +396,47 @@ impl SignRequest for RemoteSigner {
         credential: Option<&SignerToken>,
         _expires_in: Option<Duration>,
     ) -> reqsign_core::Result<()> {
+        let cache_key = (
+            self.0.signer_url.clone(),
+            req.method.to_string(),
+            self.0.region.clone(),
+            req.uri.to_string(),
+        );
+        let signed = match SIGNED_RESPONSES.get(&cache_key) {
+            Some(signed) => signed,
+            None => {
+                let signed = self.request_signature(ctx, req, credential).await?;
+                if signed.is_cacheable() {
+                    SIGNED_RESPONSES.insert(cache_key, signed.clone());
+                }
+                signed
+            }
+        };
+
+        // `Signer` commits these edits only if signing succeeds.
+        req.uri = signed.uri.parse().map_err(invalid_sign_response)?;
+        for (name, values) in signed.headers {
+            if name.eq_ignore_ascii_case("cache-control") {
+                continue;
+            }
+            let name = HeaderName::try_from(name).map_err(invalid_sign_response)?;
+            req.headers.remove(&name);
+            for value in values {
+                let value = HeaderValue::try_from(value).map_err(invalid_sign_response)?;
+                req.headers.append(&name, value);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl RemoteSigner {
+    async fn request_signature(
+        &self,
+        ctx: &Context,
+        req: &http::request::Parts,
+        credential: Option<&SignerToken>,
+    ) -> reqsign_core::Result<S3SignResponse> {
         let mut headers: HashMap<&str, Vec<&str>> = HashMap::new();
         for (name, value) in &req.headers {
             let value = value.to_str().map_err(|e| {
@@ -414,21 +475,9 @@ impl SignRequest for RemoteSigner {
             ))
             .set_retryable(resp.status().is_server_error()));
         }
-        let signed: S3SignResponse = serde_json::from_slice(resp.body()).map_err(|e| {
+        serde_json::from_slice(resp.body()).map_err(|e| {
             reqsign_core::Error::unexpected("failed to parse S3 sign response").with_source(e)
-        })?;
-
-        // `Signer` commits these edits only if signing succeeds.
-        req.uri = signed.uri.parse().map_err(invalid_sign_response)?;
-        for (name, values) in signed.headers {
-            let name = HeaderName::try_from(name).map_err(invalid_sign_response)?;
-            req.headers.remove(&name);
-            for value in values {
-                let value = HeaderValue::try_from(value).map_err(invalid_sign_response)?;
-                req.headers.append(&name, value);
-            }
-        }
-        Ok(())
+        })
     }
 }
 
@@ -589,6 +638,57 @@ mod tests {
             .unwrap();
 
         assert_eq!(content.as_ref(), b"hello");
+        signer.assert_async().await;
+        object.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn remote_signing_reuses_responses_marked_cache_control_private() {
+        let mut server = mockito::Server::new_async().await;
+        let url = server.url();
+        let signer = server
+            .mock("POST", "/v1/aws/s3/sign")
+            .with_body(
+                serde_json::json!({
+                    "uri": format!("{url}/bucket/key"),
+                    "headers": {
+                        "authorization": ["AWS4-HMAC-SHA256 remote"],
+                        "Cache-Control": ["private"],
+                    },
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let object = server
+            .mock("GET", "/bucket/key")
+            .match_header("authorization", "AWS4-HMAC-SHA256 remote")
+            .match_header("cache-control", mockito::Matcher::Missing)
+            .with_body("hello")
+            .expect(2)
+            .create_async()
+            .await;
+
+        let file_io = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::S3 {
+            customized_credential_load: None,
+        }))
+        .with_props([
+            (S3_ENDPOINT, url.as_str()),
+            (S3_PATH_STYLE_ACCESS, "true"),
+            (S3_REMOTE_SIGNING_ENABLED, "true"),
+            ("uri", url.as_str()),
+        ])
+        .build();
+        for _ in 0..2 {
+            file_io
+                .new_input("s3://bucket/key")
+                .unwrap()
+                .read()
+                .await
+                .unwrap();
+        }
+
         signer.assert_async().await;
         object.assert_async().await;
     }
