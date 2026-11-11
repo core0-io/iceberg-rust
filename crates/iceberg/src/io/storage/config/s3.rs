@@ -81,6 +81,13 @@ pub const S3_REMOTE_SIGNING_ENABLED: &str = "s3.remote-signing-enabled";
 pub const S3_SIGNER_URI: &str = "s3.signer.uri";
 /// Path of the remote signing endpoint, relative to [`S3_SIGNER_URI`].
 pub const S3_SIGNER_ENDPOINT: &str = "s3.signer.endpoint";
+/// Number of times to retry an S3 operation, `0` to disable retrying. Retries back off exponentially,
+/// with jitter, between [`S3_RETRY_MIN_WAIT_MS`] and [`S3_RETRY_MAX_WAIT_MS`].
+pub const S3_RETRY_NUM_RETRIES: &str = "s3.retry.num-retries";
+/// Minimum wait in milliseconds before retrying an S3 operation.
+pub const S3_RETRY_MIN_WAIT_MS: &str = "s3.retry.min-wait-ms";
+/// Maximum wait in milliseconds between two retries of an S3 operation.
+pub const S3_RETRY_MAX_WAIT_MS: &str = "s3.retry.max-wait-ms";
 
 /// Amazon S3 storage configuration.
 ///
