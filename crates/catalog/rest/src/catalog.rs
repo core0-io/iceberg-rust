@@ -613,11 +613,6 @@ impl RestCatalogClient {
             .await
     }
 
-    /// The bearer token `session` would attach, if any.
-    async fn token(&self, session: &dyn AuthSession) -> Option<String> {
-        self.http_client.token(session).await
-    }
-
     /// Sends `request` with the authentication derived for `context`.
     async fn query_catalog(
         &self,
@@ -1021,7 +1016,7 @@ impl RestSessionCatalog {
         // The S3 remote signer authenticates with the session's current token, which may
         // have been obtained from a `credential` rather than configured directly.
         if remote_signing_enabled(&props)
-            && let Some(token) = client.token(session).await
+            && let Some(token) = session.token().await
         {
             props.insert("token".to_string(), token);
         }
@@ -2557,7 +2552,7 @@ mod tests {
 
         let client = catalog.client().await.unwrap();
         let session = client.session(&SessionContext::empty()).await.unwrap();
-        let token = client.token(session.as_ref()).await;
+        let token = session.token().await;
         oauth_mock.assert_async().await;
         config_mock.assert_async().await;
         assert_eq!(token, Some("ey000000000000".to_string()));
@@ -2601,7 +2596,7 @@ mod tests {
 
         let client = catalog.client().await.unwrap();
         let session = client.session(&SessionContext::empty()).await.unwrap();
-        let token = client.token(session.as_ref()).await;
+        let token = session.token().await;
 
         oauth_mock.assert_async().await;
         config_mock.assert_async().await;
@@ -2705,7 +2700,7 @@ mod tests {
 
         let client = catalog.client().await.unwrap();
         let session = client.session(&SessionContext::empty()).await.unwrap();
-        let token = client.token(session.as_ref()).await;
+        let token = session.token().await;
 
         oauth_mock.assert_async().await;
         config_mock.assert_async().await;

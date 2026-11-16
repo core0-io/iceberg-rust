@@ -115,6 +115,11 @@ pub trait AuthManager: Debug + Send + Sync {
 pub trait AuthSession: Debug + Send + Sync {
     /// Applies authentication to the request (adds headers, signs, ...).
     async fn authenticate(&self, request: &mut HttpRequest) -> Result<()>;
+
+    /// The bearer token this session currently attaches, if it uses one.
+    async fn token(&self) -> Option<String> {
+        None
+    }
 }
 
 /// [`AuthManager`] that performs no authentication.

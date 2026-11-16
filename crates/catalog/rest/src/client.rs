@@ -115,27 +115,6 @@ impl HttpClient {
         })
     }
 
-    /// The bearer token `session` would attach, if any.
-    ///
-    /// Authenticates a throwaway request (never sent) and reads the header
-    /// back, so it works for any [`AuthSession`].
-    pub(crate) async fn token(&self, auth_session: &dyn AuthSession) -> Option<String> {
-        let mut request = HttpRequest::build(
-            self.client
-                .request(Method::GET, "http://localhost/token-probe"),
-        )
-        .ok()?;
-        auth_session.authenticate(&mut request).await.ok()?;
-        let request = request.into_inner();
-        request
-            .headers()
-            .get(reqwest::header::AUTHORIZATION)?
-            .to_str()
-            .ok()?
-            .strip_prefix("Bearer ")
-            .map(str::to_string)
-    }
-
     #[inline]
     pub(crate) fn request<U: IntoUrl>(&self, method: Method, url: U) -> RequestBuilder {
         self.client

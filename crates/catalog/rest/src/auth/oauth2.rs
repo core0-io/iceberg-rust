@@ -312,32 +312,40 @@ impl ClientCredentialsConfig {
     }
 }
 
+impl OAuth2Session {
+    /// The cached token, exchanging the credential for one first if needed.
+    async fn current_token(&self) -> Result<Option<SensitiveString>> {
+        // The lock is held across the exchange: waiters reuse a successful
+        // result, and retry themselves after a failure.
+        let mut token = self.token.lock().await;
+        match (&*token, &self.token_source) {
+            (Some(token), _) => Ok(Some(token.clone())),
+            (None, TokenSource::StaticToken) => Ok(None),
+            (None, TokenSource::ClientCredentials(config)) => {
+                let new_token =
+                    SensitiveString::from(config.exchange_credential_for_token().await?);
+                *token = Some(new_token.clone());
+                Ok(Some(new_token))
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl AuthSession for OAuth2Session {
     /// Uses the cached token when present; otherwise exchanges the credential
     /// for one, caches it, then uses it. Without a credential and without a
     /// token, no authentication is attached.
     async fn authenticate(&self, req: &mut HttpRequest) -> Result<()> {
-        // The lock is held across the exchange: waiters reuse a successful
-        // result, and retry themselves after a failure.
-        let token = {
-            let mut token = self.token.lock().await;
-            match (&*token, &self.token_source) {
-                (Some(token), _) => Some(token.clone()),
-                (None, TokenSource::StaticToken) => None,
-                (None, TokenSource::ClientCredentials(config)) => {
-                    let new_token =
-                        SensitiveString::from(config.exchange_credential_for_token().await?);
-                    *token = Some(new_token.clone());
-                    Some(new_token)
-                }
-            }
-        };
-
-        match token {
+        match self.current_token().await? {
             Some(token) => attach_bearer(req, &token),
             None => Ok(()),
         }
+    }
+
+    async fn token(&self) -> Option<String> {
+        let token = self.current_token().await.ok()??;
+        Some(token.expose().to_string())
     }
 }
 
