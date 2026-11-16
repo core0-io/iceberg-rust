@@ -27,9 +27,9 @@ use iceberg::io::{
     CLIENT_REGION, S3_ACCESS_KEY_ID, S3_ALLOW_ANONYMOUS, S3_ASSUME_ROLE_ARN,
     S3_ASSUME_ROLE_EXTERNAL_ID, S3_ASSUME_ROLE_SESSION_NAME, S3_DISABLE_CONFIG_LOAD,
     S3_DISABLE_EC2_METADATA, S3_ENDPOINT, S3_MULTIPART_PART_SIZE_BYTES, S3_PATH_STYLE_ACCESS,
-    S3_REGION, S3_REMOTE_SIGNING_ENABLED, S3_RETRY_MAX_WAIT_MS, S3_RETRY_MIN_WAIT_MS,
-    S3_RETRY_NUM_RETRIES, S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN, S3_SIGNER_ENDPOINT,
-    S3_SIGNER_URI, S3_SSE_KEY, S3_SSE_MD5, S3_SSE_TYPE,
+    S3_REGION, S3_REMOTE_SIGNING_CONFIG, S3_REMOTE_SIGNING_ENABLED, S3_RETRY_MAX_WAIT_MS,
+    S3_RETRY_MIN_WAIT_MS, S3_RETRY_NUM_RETRIES, S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN,
+    S3_SIGNER_ENDPOINT, S3_SIGNER_URI, S3_SSE_KEY, S3_SSE_MD5, S3_SSE_TYPE,
 };
 use iceberg::{Error, ErrorKind, Result};
 use iceberg_property_macro::Properties;
@@ -217,29 +217,53 @@ fn s3_remote_signing_parse(
     {
         return Ok(None);
     }
-    let base_uri = m
-        .get(S3_SIGNER_URI)
-        .or_else(|| m.get(CATALOG_URI))
-        .ok_or_else(|| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!("{S3_REMOTE_SIGNING_ENABLED} requires {S3_SIGNER_URI} or {CATALOG_URI}"),
-            )
-        })?;
     let endpoint = m
         .get(S3_SIGNER_ENDPOINT)
+        .or_else(|| m.get(LEGACY_SIGNER_ENDPOINT))
         .map_or(DEFAULT_SIGNER_ENDPOINT, String::as_str);
-    Ok(Some(S3RemoteSigning {
-        signer_url: format!(
+    let signer_url = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint.to_string()
+    } else {
+        let base_uri = m
+            .get(S3_SIGNER_URI)
+            .or_else(|| m.get(LEGACY_SIGNER_URI))
+            .or_else(|| m.get(CATALOG_URI))
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "{S3_REMOTE_SIGNING_ENABLED} requires {S3_SIGNER_URI} or {CATALOG_URI}"
+                    ),
+                )
+            })?;
+        format!(
             "{}/{}",
             base_uri.trim_end_matches('/'),
             endpoint.trim_start_matches('/')
-        ),
+        )
+    };
+    let config = m
+        .get(S3_REMOTE_SIGNING_CONFIG)
+        .map(|json| {
+            serde_json::from_str::<SignerConfig>(json).map_err(|e| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Invalid {S3_REMOTE_SIGNING_CONFIG}"),
+                )
+                .with_source(e)
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+    Ok(Some(S3RemoteSigning {
+        signer_url,
         region: cfg
             .region
             .clone()
             .unwrap_or_else(|| DEFAULT_REGION.to_string()),
         token: m.get(CATALOG_TOKEN).cloned(),
+        properties: config.properties,
+        headers: config.headers,
     }))
 }
 
@@ -288,6 +312,8 @@ pub(crate) fn s3_config_build(
 
 const CATALOG_URI: &str = "uri";
 const CATALOG_TOKEN: &str = "token";
+const LEGACY_SIGNER_URI: &str = "signer.uri";
+const LEGACY_SIGNER_ENDPOINT: &str = "signer.endpoint";
 const DEFAULT_SIGNER_ENDPOINT: &str = "v1/aws/s3/sign";
 const DEFAULT_REGION: &str = "us-east-1";
 const X_AMZ_CONTENT_SHA256: &str = "x-amz-content-sha256";
@@ -298,6 +324,19 @@ pub struct S3RemoteSigning {
     signer_url: String,
     region: String,
     token: Option<String>,
+    #[serde(default)]
+    properties: HashMap<String, String>,
+    #[serde(default)]
+    headers: HashMap<String, Vec<String>>,
+}
+
+/// The REST catalog's `remote-signing-config`.
+#[derive(Default, Deserialize)]
+struct SignerConfig {
+    #[serde(default)]
+    properties: HashMap<String, String>,
+    #[serde(default)]
+    headers: HashMap<String, Vec<String>>,
 }
 
 impl std::fmt::Debug for S3RemoteSigning {
@@ -350,6 +389,9 @@ struct S3SignRequest<'a> {
     method: &'a str,
     uri: String,
     headers: HashMap<&'a str, Vec<&'a str>>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    properties: &'a HashMap<String, String>,
+    provider: &'a str,
 }
 
 #[derive(Clone, Deserialize)]
@@ -452,6 +494,8 @@ impl RemoteSigner {
             method: req.method.as_str(),
             uri: req.uri.to_string(),
             headers,
+            properties: &self.0.properties,
+            provider: "s3",
         };
         let body = serde_json::to_vec(&body).map_err(|e| {
             reqsign_core::Error::unexpected("failed to serialise S3 sign request").with_source(e)
@@ -459,6 +503,11 @@ impl RemoteSigner {
 
         let mut sign_req =
             Request::post(&self.0.signer_url).header(CONTENT_TYPE, "application/json");
+        for (name, values) in &self.0.headers {
+            for value in values {
+                sign_req = sign_req.header(name, value);
+            }
+        }
         if let Some(token) = credential.and_then(|c| c.0.as_deref()) {
             sign_req = sign_req.header(AUTHORIZATION, format!("Bearer {token}"));
         }
@@ -541,8 +590,8 @@ mod tests {
     use iceberg::Result;
     use iceberg::io::{
         FileIOBuilder, S3_ENDPOINT, S3_MULTIPART_PART_SIZE_BYTES, S3_PATH_STYLE_ACCESS,
-        S3_REMOTE_SIGNING_ENABLED, S3_RETRY_MAX_WAIT_MS, S3_RETRY_MIN_WAIT_MS,
-        S3_RETRY_NUM_RETRIES,
+        S3_REMOTE_SIGNING_CONFIG, S3_REMOTE_SIGNING_ENABLED, S3_RETRY_MAX_WAIT_MS,
+        S3_RETRY_MIN_WAIT_MS, S3_RETRY_NUM_RETRIES, S3_SIGNER_ENDPOINT,
     };
     use opendal::layers::RetryLayer;
     use reqsign_core::{Context, SignRequest};
@@ -568,6 +617,8 @@ mod tests {
     #[tokio::test]
     async fn remote_signing_rejects_non_ascii_header_values() {
         let signer = RemoteSigner(S3RemoteSigning {
+            properties: HashMap::new(),
+            headers: HashMap::new(),
             signer_url: "http://127.0.0.1:1/v1/aws/s3/sign".to_string(),
             region: "us-east-1".to_string(),
             token: None,
@@ -691,6 +742,89 @@ mod tests {
 
         signer.assert_async().await;
         object.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn remote_signing_uses_table_endpoint_and_signer_config() {
+        let mut server = mockito::Server::new_async().await;
+        let url = server.url();
+        let signer = server
+            .mock("POST", "/v1/namespaces/ns/tables/t/sign")
+            .match_header("x-static", "one")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "provider": "s3",
+                "properties": { "k": "v" },
+            })))
+            .with_body(
+                serde_json::json!({
+                    "uri": format!("{url}/bucket/key"),
+                    "headers": { "authorization": ["AWS4-HMAC-SHA256 remote"] },
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let object = server
+            .mock("GET", "/bucket/key")
+            .match_header("authorization", "AWS4-HMAC-SHA256 remote")
+            .with_body("hello")
+            .create_async()
+            .await;
+
+        let file_io = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::S3 {
+            customized_credential_load: None,
+        }))
+        .with_props([
+            (S3_ENDPOINT, url.as_str()),
+            (S3_PATH_STYLE_ACCESS, "true"),
+            (S3_REMOTE_SIGNING_ENABLED, "true"),
+            (
+                S3_SIGNER_ENDPOINT,
+                format!("{url}/v1/namespaces/ns/tables/t/sign").as_str(),
+            ),
+            (
+                S3_REMOTE_SIGNING_CONFIG,
+                r#"{"properties":{"k":"v"},"headers":{"x-static":["one"]}}"#,
+            ),
+        ])
+        .build();
+        file_io
+            .new_input("s3://bucket/key")
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+
+        signer.assert_async().await;
+        object.assert_async().await;
+    }
+
+    #[test]
+    fn remote_signing_accepts_legacy_signer_properties() {
+        let props = HashMap::from([
+            (S3_REMOTE_SIGNING_ENABLED.to_string(), "true".to_string()),
+            ("signer.uri".to_string(), "http://signer/base/".to_string()),
+            ("signer.endpoint".to_string(), "custom/sign".to_string()),
+        ]);
+
+        let (_, signing) = s3_config_parse(props).unwrap();
+
+        assert_eq!(
+            signing.unwrap().signer_url,
+            "http://signer/base/custom/sign"
+        );
+    }
+
+    #[test]
+    fn remote_signing_rejects_invalid_signer_config() {
+        let props = HashMap::from([
+            (S3_REMOTE_SIGNING_ENABLED.to_string(), "true".to_string()),
+            ("uri".to_string(), "http://catalog".to_string()),
+            (S3_REMOTE_SIGNING_CONFIG.to_string(), "not json".to_string()),
+        ]);
+
+        assert!(s3_config_parse(props).is_err());
     }
 
     #[test]

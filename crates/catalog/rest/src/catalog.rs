@@ -28,8 +28,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use iceberg::encryption::kms::{KeyManagementClient, KmsClientFactory};
 use iceberg::io::{
-    ADLS_SAS_TOKEN, FileIO, FileIOBuilder, GCS_TOKEN, S3_REMOTE_SIGNING_ENABLED, S3_SESSION_TOKEN,
-    StorageFactory,
+    ADLS_SAS_TOKEN, FileIO, FileIOBuilder, GCS_TOKEN, S3_REMOTE_SIGNING_CONFIG,
+    S3_REMOTE_SIGNING_ENABLED, S3_SESSION_TOKEN, S3_SIGNER_ENDPOINT, S3_SIGNER_URI, StorageFactory,
 };
 use iceberg::table::Table;
 use iceberg::{
@@ -56,7 +56,7 @@ use crate::response::HttpResponse;
 use crate::types::{
     CatalogConfig, CommitTableRequest, CommitTableResponse, CreateNamespaceRequest,
     CreateTableRequest, ListNamespaceResponse, ListTablesResponse, LoadTableResult,
-    NamespaceResponse, RegisterTableRequest, RenameTableRequest,
+    NamespaceResponse, RegisterTableRequest, RemoteSigningConfig, RenameTableRequest,
 };
 
 /// REST catalog URI
@@ -105,6 +105,57 @@ fn remote_signing_enabled(props: &HashMap<String, String>) -> bool {
     props
         .get(S3_REMOTE_SIGNING_ENABLED)
         .is_some_and(|v| ["true", "t", "1", "on"].contains(&v.to_lowercase().as_str()))
+}
+
+/// The legacy, unprefixed spellings of [`S3_SIGNER_URI`] and [`S3_SIGNER_ENDPOINT`].
+const SIGNER_URI: &str = "signer.uri";
+const SIGNER_ENDPOINT: &str = "signer.endpoint";
+
+/// The FileIO config for a table: the response `config` overlaid with the user's
+/// properties, plus the remote signer settings when S3 remote signing is enabled.
+///
+/// Without an explicit signer location the signer is the table's `sign` endpoint.
+fn table_file_io_config(
+    catalog_config: &RestCatalogConfig,
+    table: &TableIdent,
+    response_config: HashMap<String, String>,
+    remote_signing: Option<RemoteSigningConfig>,
+    user_props: &HashMap<String, String>,
+) -> Result<HashMap<String, String>> {
+    let mut config: HashMap<_, _> = response_config
+        .into_iter()
+        .chain(user_props.clone())
+        .collect();
+    if !remote_signing_enabled(&config) {
+        return Ok(config);
+    }
+    if [
+        S3_SIGNER_URI,
+        S3_SIGNER_ENDPOINT,
+        SIGNER_URI,
+        SIGNER_ENDPOINT,
+    ]
+    .into_iter()
+    .all(|key| !config.contains_key(key))
+    {
+        config.insert(
+            S3_SIGNER_ENDPOINT.to_string(),
+            format!("{}/sign", catalog_config.table_endpoint(table)),
+        );
+    }
+    if let Some(remote_signing) = remote_signing {
+        config.insert(
+            S3_REMOTE_SIGNING_CONFIG.to_string(),
+            serde_json::to_string(&remote_signing).map_err(|e| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    "Failed to serialise remote-signing-config",
+                )
+                .with_source(e)
+            })?,
+        );
+    }
+    Ok(config)
 }
 
 const ICEBERG_REST_SPEC_VERSION: &str = "0.14.1";
@@ -1363,11 +1414,13 @@ impl SessionCatalog for RestSessionCatalog {
             "Metadata location missing in `create_table` response!",
         ))?;
 
-        let config = response
-            .config
-            .into_iter()
-            .chain(self.user_config.props.clone())
-            .collect();
+        let config = table_file_io_config(
+            &client.config,
+            &table_ident,
+            response.config,
+            response.remote_signing_config,
+            &self.user_config.props,
+        )?;
 
         let file_io = self
             .load_file_io(session.as_ref(), Some(metadata_location), Some(config))
@@ -1460,11 +1513,13 @@ impl SessionCatalog for RestSessionCatalog {
                 .keys()
                 .any(|key| is_short_lived_credential(key));
 
-        let config: HashMap<_, _> = response
-            .config
-            .into_iter()
-            .chain(self.user_config.props.clone())
-            .collect();
+        let config = table_file_io_config(
+            &client.config,
+            table_ident,
+            response.config,
+            response.remote_signing_config,
+            &self.user_config.props,
+        )?;
         let cacheable = !vends_credentials && !remote_signing_enabled(&config);
 
         let file_io = self
@@ -4828,6 +4883,78 @@ mod tests {
         }
 
         load.assert_async().await;
+    }
+
+    async fn load_table_signer_props(
+        config: serde_json::Value,
+        remote_signing_config: Option<serde_json::Value>,
+    ) -> (String, HashMap<String, String>) {
+        let mut server = Server::new_async().await;
+        let _config = create_config_mock(&mut server).await;
+        let mut body = load_table_body("v1");
+        body["config"] = config;
+        if let Some(remote_signing_config) = remote_signing_config {
+            body["remote-signing-config"] = remote_signing_config;
+        }
+        let _load = server
+            .mock("GET", "/v1/namespaces/ns1/tables/test1")
+            .with_status(200)
+            .with_body(body.to_string())
+            .create_async()
+            .await;
+        let catalog = session_catalog(RestCatalogConfig::builder().uri(server.url()).build());
+
+        let table = catalog
+            .load_table(&SessionContext::empty(), &test_table_ident())
+            .await
+            .unwrap();
+
+        (server.url(), table.file_io().config().props().clone())
+    }
+
+    #[tokio::test]
+    async fn test_load_table_remote_signing_defaults_to_table_sign_endpoint() {
+        let (url, props) = load_table_signer_props(
+            json!({ S3_REMOTE_SIGNING_ENABLED: "true" }),
+            Some(json!({ "properties": { "k": "v" }, "headers": { "x-h": ["1"] } })),
+        )
+        .await;
+
+        assert_eq!(
+            props.get(S3_SIGNER_ENDPOINT),
+            Some(&format!("{url}/v1/namespaces/ns1/tables/test1/sign"))
+        );
+        let signer_config: serde_json::Value =
+            serde_json::from_str(&props[S3_REMOTE_SIGNING_CONFIG]).unwrap();
+        assert_eq!(
+            signer_config,
+            json!({ "properties": { "k": "v" }, "headers": { "x-h": ["1"] } })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_table_remote_signing_keeps_explicit_signer_endpoint() {
+        let (_, props) = load_table_signer_props(
+            json!({ S3_REMOTE_SIGNING_ENABLED: "true", "signer.endpoint": "custom/sign" }),
+            None,
+        )
+        .await;
+
+        assert_eq!(props.get(S3_SIGNER_ENDPOINT), None);
+        assert_eq!(
+            props.get("signer.endpoint").map(String::as_str),
+            Some("custom/sign")
+        );
+        assert_eq!(props.get(S3_REMOTE_SIGNING_CONFIG), None);
+    }
+
+    #[tokio::test]
+    async fn test_load_table_without_remote_signing_ignores_signer_config() {
+        let (_, props) =
+            load_table_signer_props(json!({}), Some(json!({ "properties": { "k": "v" } }))).await;
+
+        assert_eq!(props.get(S3_SIGNER_ENDPOINT), None);
+        assert_eq!(props.get(S3_REMOTE_SIGNING_CONFIG), None);
     }
 
     #[test]

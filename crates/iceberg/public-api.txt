@@ -1118,6 +1118,7 @@ pub const iceberg::io::S3_ENDPOINT: &str
 pub const iceberg::io::S3_MULTIPART_PART_SIZE_BYTES: &str
 pub const iceberg::io::S3_PATH_STYLE_ACCESS: &str
 pub const iceberg::io::S3_REGION: &str
+pub const iceberg::io::S3_REMOTE_SIGNING_CONFIG: &str
 pub const iceberg::io::S3_REMOTE_SIGNING_ENABLED: &str
 pub const iceberg::io::S3_RETRY_MAX_WAIT_MS: &str
 pub const iceberg::io::S3_RETRY_MIN_WAIT_MS: &str

@@ -229,6 +229,20 @@ pub struct LoadTableResult {
     /// before falling back to credentials in the `config` field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_credentials: Option<Vec<StorageCredential>>,
+    /// Settings for the remote signer client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) remote_signing_config: Option<RemoteSigningConfig>,
+}
+
+/// Static values the signer client passes through to the signing endpoint unchanged.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RemoteSigningConfig {
+    /// Sent in the `properties` of every sign request.
+    #[serde(default)]
+    pub(crate) properties: HashMap<String, String>,
+    /// Sent as headers of every sign request.
+    #[serde(default)]
+    pub(crate) headers: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
