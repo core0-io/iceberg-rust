@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use http::StatusCode;
@@ -49,7 +50,7 @@ struct OAuth2Params {
 /// for a token at the token endpoint and cached. The cached token is shared
 /// across sessions so it survives the config handshake.
 pub struct OAuth2Manager {
-    token: Arc<Mutex<Option<SensitiveString>>>,
+    token: Arc<Mutex<Option<CachedToken>>>,
     init_params: OAuth2Params,
     /// True when the token endpoint was derived from the catalog URI (not
     /// explicitly configured): it is then recomputed from the merged URI in
@@ -81,7 +82,9 @@ impl OAuth2Manager {
 
     /// Sets a bearer token used directly (takes precedence over `credential`).
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
-        self.token = Arc::new(Mutex::new(Some(SensitiveString::from(token.into()))));
+        self.token = Arc::new(Mutex::new(Some(CachedToken::fixed(SensitiveString::from(
+            token.into(),
+        )))));
         self
     }
 
@@ -107,7 +110,10 @@ impl OAuth2Manager {
 
     pub(crate) fn from_config(cfg: &RestCatalogConfig) -> Result<Self> {
         Ok(Self {
-            token: Arc::new(Mutex::new(cfg.token().map(SensitiveString::from))),
+            token: Arc::new(Mutex::new(
+                cfg.token()
+                    .map(|token| CachedToken::fixed(SensitiveString::from(token))),
+            )),
             init_params: OAuth2Params {
                 extra_headers: cfg.extra_headers()?,
                 token_endpoint: cfg.get_token_endpoint(),
@@ -158,7 +164,8 @@ impl OAuth2Manager {
     ) -> Result<OAuth2Session> {
         // The properties may carry a new token (or restate the user's).
         if let Some(token) = props.get("token") {
-            *self.token.lock().await = Some(SensitiveString::from(token.clone()));
+            *self.token.lock().await =
+                Some(CachedToken::fixed(SensitiveString::from(token.clone())));
         }
 
         let mut extra_headers = self.init_params.extra_headers.clone();
@@ -223,16 +230,45 @@ fn attach_bearer(req: &mut HttpRequest, token: &SensitiveString) -> Result<()> {
     Ok(())
 }
 
+/// A bearer token and, when the server stated a lifetime, when to replace it.
+struct CachedToken {
+    token: SensitiveString,
+    refresh_at: Option<Instant>,
+}
+
+impl CachedToken {
+    /// A configured token, which is never replaced.
+    fn fixed(token: SensitiveString) -> Self {
+        Self {
+            token,
+            refresh_at: None,
+        }
+    }
+
+    /// A token exchanged for a credential, replaced after 90% of its lifetime so the
+    /// server never sees it expired.
+    fn exchanged(token: SensitiveString, expires_in: Option<u64>) -> Self {
+        Self {
+            token,
+            refresh_at: expires_in
+                .map(|seconds| Instant::now() + Duration::from_secs(seconds).mul_f64(0.9)),
+        }
+    }
+
+    fn is_fresh(&self) -> bool {
+        self.refresh_at.is_none_or(|at| Instant::now() < at)
+    }
+}
+
 /// [`AuthSession`] attaching an OAuth2 bearer token.
 ///
 /// The token is a configured one (which replaces whatever the cell holds), a
 /// token cached by an earlier session (the cell is shared with the owning
 /// [`OAuth2Manager`]), or — with [`TokenSource::ClientCredentials`] — one
-/// exchanged for the credential on demand.
-///
-/// # TODO: Support automatic token refreshing.
+/// exchanged for the credential on demand and exchanged again once it nears
+/// the end of its lifetime.
 struct OAuth2Session {
-    token: Arc<Mutex<Option<SensitiveString>>>,
+    token: Arc<Mutex<Option<CachedToken>>>,
     token_source: TokenSource,
 }
 
@@ -264,7 +300,7 @@ impl Debug for OAuth2Session {
 }
 
 impl ClientCredentialsConfig {
-    async fn exchange_credential_for_token(&self) -> Result<String> {
+    async fn exchange_credential_for_token(&self) -> Result<(String, Option<u64>)> {
         let (client_id, client_secret) = &self.credential;
 
         let mut params = HashMap::with_capacity(4);
@@ -308,24 +344,28 @@ impl ClientCredentialsConfig {
             })?;
             Err(Error::from(e))
         }?;
-        Ok(auth_res.access_token)
+        Ok((auth_res.access_token, auth_res.expires_in))
     }
 }
 
 impl OAuth2Session {
-    /// The cached token, exchanging the credential for one first if needed.
+    /// The cached token, exchanging the credential for a new one first when there is
+    /// none or it is nearly expired.
     async fn current_token(&self) -> Result<Option<SensitiveString>> {
         // The lock is held across the exchange: waiters reuse a successful
         // result, and retry themselves after a failure.
-        let mut token = self.token.lock().await;
-        match (&*token, &self.token_source) {
-            (Some(token), _) => Ok(Some(token.clone())),
-            (None, TokenSource::StaticToken) => Ok(None),
-            (None, TokenSource::ClientCredentials(config)) => {
-                let new_token =
-                    SensitiveString::from(config.exchange_credential_for_token().await?);
-                *token = Some(new_token.clone());
-                Ok(Some(new_token))
+        let mut cached = self.token.lock().await;
+        match (&*cached, &self.token_source) {
+            (Some(cached), _) if cached.is_fresh() => Ok(Some(cached.token.clone())),
+            (_, TokenSource::ClientCredentials(config)) => {
+                let (token, expires_in) = config.exchange_credential_for_token().await?;
+                let new = CachedToken::exchanged(SensitiveString::from(token), expires_in);
+                let token = new.token.clone();
+                *cached = Some(new);
+                Ok(Some(token))
+            }
+            (cached, TokenSource::StaticToken) => {
+                Ok(cached.as_ref().map(|cached| cached.token.clone()))
             }
         }
     }
@@ -387,5 +427,56 @@ mod tests {
             req.headers().get("authorization").unwrap(),
             "Bearer tok-static"
         );
+    }
+
+    async fn exchanging_session(
+        server: &mut mockito::ServerGuard,
+        expires_in: u64,
+        exchanges: usize,
+    ) -> (Box<dyn AuthSession>, mockito::Mock) {
+        let token_mock = server
+            .mock("POST", "/token")
+            .with_body(
+                serde_json::json!({
+                    "access_token": "tok-exchanged",
+                    "token_type": "Bearer",
+                    "expires_in": expires_in,
+                })
+                .to_string(),
+            )
+            .expect(exchanges)
+            .create_async()
+            .await;
+        let manager = OAuth2Manager::new(format!("{}/token", server.url()))
+            .with_credential(Some("id".to_string()), "secret".to_string());
+        let session = manager
+            .init_session(&test_client(), &HashMap::new())
+            .await
+            .unwrap();
+        (session, token_mock)
+    }
+
+    #[tokio::test]
+    async fn test_exchanged_token_is_exchanged_again_once_expired() {
+        let mut server = mockito::Server::new_async().await;
+        let (session, token_mock) = exchanging_session(&mut server, 0, 3).await;
+
+        for _ in 0..3 {
+            assert_eq!(session.token().await.as_deref(), Some("tok-exchanged"));
+        }
+
+        token_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_exchanged_token_is_reused_while_fresh() {
+        let mut server = mockito::Server::new_async().await;
+        let (session, token_mock) = exchanging_session(&mut server, 3600, 1).await;
+
+        for _ in 0..3 {
+            assert_eq!(session.token().await.as_deref(), Some("tok-exchanged"));
+        }
+
+        token_mock.assert_async().await;
     }
 }

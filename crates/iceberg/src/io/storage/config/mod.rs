@@ -38,7 +38,10 @@ mod oss;
 mod s3;
 
 use std::collections::HashMap;
+use std::fmt::Debug;
+use std::sync::Arc;
 
+use async_trait::async_trait;
 pub use azdls::*;
 pub use gcs::*;
 pub use hdfs_native::*;
@@ -56,14 +59,38 @@ use serde::{Deserialize, Serialize};
 pub struct StorageConfig {
     /// Configuration properties for the storage backend
     props: HashMap<String, String>,
+    /// Supplies the catalog bearer token on demand; not serialised.
+    #[serde(skip)]
+    token_provider: Option<SharedTokenProvider>,
 }
+
+/// Supplies the bearer token a storage backend presents to the catalog, for example when
+/// the catalog signs its requests remotely.
+///
+/// Unlike a token copied into the properties, the provider is asked each time, so a refreshed
+/// token is picked up.
+#[async_trait]
+pub trait TokenProvider: Debug + Send + Sync {
+    /// The token currently valid for the catalog, if there is one.
+    async fn token(&self) -> Option<String>;
+}
+
+/// A [`TokenProvider`] compared by identity, so [`StorageConfig`] stays comparable.
+#[derive(Clone, Debug)]
+struct SharedTokenProvider(Arc<dyn TokenProvider>);
+
+impl PartialEq for SharedTokenProvider {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for SharedTokenProvider {}
 
 impl StorageConfig {
     /// Create a new empty StorageConfig.
     pub fn new() -> Self {
-        Self {
-            props: HashMap::new(),
-        }
+        Self::default()
     }
 
     /// Create a StorageConfig from existing properties.
@@ -72,7 +99,21 @@ impl StorageConfig {
     ///
     /// * `props` - Configuration properties for the storage backend
     pub fn from_props(props: HashMap<String, String>) -> Self {
-        Self { props }
+        Self {
+            props,
+            token_provider: None,
+        }
+    }
+
+    /// The catalog token provider, if one was set.
+    pub fn token_provider(&self) -> Option<&Arc<dyn TokenProvider>> {
+        self.token_provider.as_ref().map(|provider| &provider.0)
+    }
+
+    /// Set the provider of the catalog bearer token.
+    pub fn with_token_provider(mut self, provider: Arc<dyn TokenProvider>) -> Self {
+        self.token_provider = Some(SharedTokenProvider(provider));
+        self
     }
 
     /// Get all configuration properties.

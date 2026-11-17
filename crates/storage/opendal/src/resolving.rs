@@ -25,6 +25,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::BoxStream;
+#[cfg(feature = "opendal-s3")]
+use iceberg::io::TokenProvider;
 use iceberg::io::{
     FileMetadata, FileRead, FileWrite, InputFile, OutputFile, Storage, StorageConfig,
     StorageFactory,
@@ -87,6 +89,7 @@ fn build_storage_for_scheme(
     scheme: &'static str,
     props: &HashMap<String, String>,
     #[cfg(feature = "opendal-s3")] customized_credential_load: &Option<CustomAwsCredentialLoader>,
+    #[cfg(feature = "opendal-s3")] token_provider: &Option<Arc<dyn TokenProvider>>,
 ) -> Result<OpenDalStorage> {
     let client_config = OpenDalClientConfig::from_properties(props)?;
     match scheme {
@@ -96,7 +99,8 @@ fn build_storage_for_scheme(
             Ok(OpenDalStorage::S3 {
                 config: Arc::new(config),
                 multipart_part_size: crate::s3::s3_multipart_part_size_parse(props)?,
-                remote_signing,
+                remote_signing: remote_signing
+                    .map(|signing| signing.with_token_provider(token_provider.clone())),
                 customized_credential_load: customized_credential_load.clone(),
                 client_config: crate::s3::s3_client_config(props, client_config)?,
             })
@@ -222,6 +226,8 @@ impl StorageFactory for OpenDalResolvingStorageFactory {
             storages: RwLock::new(HashMap::new()),
             #[cfg(feature = "opendal-s3")]
             customized_credential_load: self.customized_credential_load.clone(),
+            #[cfg(feature = "opendal-s3")]
+            token_provider: config.token_provider().cloned(),
         }))
     }
 }
@@ -243,6 +249,10 @@ pub struct OpenDalResolvingStorage {
     #[cfg(feature = "opendal-s3")]
     #[serde(skip)]
     customized_credential_load: Option<CustomAwsCredentialLoader>,
+    /// Supplies the catalog token to the S3 remote signer.
+    #[cfg(feature = "opendal-s3")]
+    #[serde(skip)]
+    token_provider: Option<Arc<dyn TokenProvider>>,
 }
 
 impl OpenDalResolvingStorage {
@@ -278,6 +288,8 @@ impl OpenDalResolvingStorage {
             &self.props,
             #[cfg(feature = "opendal-s3")]
             &self.customized_credential_load,
+            #[cfg(feature = "opendal-s3")]
+            &self.token_provider,
         )?;
         let storage = Arc::new(storage);
         cache.insert(scheme, storage.clone());
@@ -398,6 +410,8 @@ mod tests {
             storages: RwLock::new(HashMap::new()),
             #[cfg(feature = "opendal-s3")]
             customized_credential_load: None,
+            #[cfg(feature = "opendal-s3")]
+            token_provider: None,
         }
     }
 

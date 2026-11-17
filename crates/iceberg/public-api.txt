@@ -828,6 +828,7 @@ pub fn iceberg::io::FileIOBuilder::config(&self) -> &iceberg::io::StorageConfig
 pub fn iceberg::io::FileIOBuilder::new(factory: alloc::sync::Arc<dyn iceberg::io::StorageFactory>) -> Self
 pub fn iceberg::io::FileIOBuilder::with_prop(self, key: impl alloc::string::ToString, value: impl alloc::string::ToString) -> Self
 pub fn iceberg::io::FileIOBuilder::with_props(self, args: impl core::iter::traits::collect::IntoIterator<Item = (impl alloc::string::ToString, impl alloc::string::ToString)>) -> Self
+pub fn iceberg::io::FileIOBuilder::with_token_provider(self, provider: alloc::sync::Arc<dyn iceberg::io::TokenProvider>) -> Self
 impl core::clone::Clone for iceberg::io::FileIOBuilder
 pub fn iceberg::io::FileIOBuilder::clone(&self) -> iceberg::io::FileIOBuilder
 impl core::fmt::Debug for iceberg::io::FileIOBuilder
@@ -1048,8 +1049,10 @@ pub fn iceberg::io::StorageConfig::from_props(props: std::collections::hash::map
 pub fn iceberg::io::StorageConfig::get(&self, key: &str) -> core::option::Option<&alloc::string::String>
 pub fn iceberg::io::StorageConfig::new() -> Self
 pub fn iceberg::io::StorageConfig::props(&self) -> &std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>
+pub fn iceberg::io::StorageConfig::token_provider(&self) -> core::option::Option<&alloc::sync::Arc<dyn iceberg::io::TokenProvider>>
 pub fn iceberg::io::StorageConfig::with_prop(self, key: impl core::convert::Into<alloc::string::String>, value: impl core::convert::Into<alloc::string::String>) -> Self
 pub fn iceberg::io::StorageConfig::with_props(self, props: impl core::iter::traits::collect::IntoIterator<Item = (impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>)>) -> Self
+pub fn iceberg::io::StorageConfig::with_token_provider(self, provider: alloc::sync::Arc<dyn iceberg::io::TokenProvider>) -> Self
 impl core::clone::Clone for iceberg::io::StorageConfig
 pub fn iceberg::io::StorageConfig::clone(&self) -> iceberg::io::StorageConfig
 impl core::cmp::Eq for iceberg::io::StorageConfig
@@ -1184,6 +1187,8 @@ impl iceberg::io::StorageFactory for iceberg::io::LocalFsStorageFactory
 pub fn iceberg::io::LocalFsStorageFactory::build(&self, _config: &iceberg::io::StorageConfig) -> iceberg::Result<alloc::sync::Arc<dyn iceberg::io::Storage>>
 impl iceberg::io::StorageFactory for iceberg::io::MemoryStorageFactory
 pub fn iceberg::io::MemoryStorageFactory::build(&self, _config: &iceberg::io::StorageConfig) -> iceberg::Result<alloc::sync::Arc<dyn iceberg::io::Storage>>
+pub trait iceberg::io::TokenProvider: core::fmt::Debug + core::marker::Send + core::marker::Sync
+pub fn iceberg::io::TokenProvider::token<'life0, 'async_trait>(&'life0 self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::option::Option<alloc::string::String>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub mod iceberg::memory
 pub struct iceberg::memory::MemoryCatalog
 impl core::fmt::Debug for iceberg::memory::MemoryCatalog

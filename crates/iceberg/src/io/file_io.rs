@@ -23,6 +23,7 @@ use futures::{Stream, StreamExt};
 
 use super::storage::{
     LocalFsStorageFactory, MemoryStorageFactory, Storage, StorageConfig, StorageFactory,
+    TokenProvider,
 };
 use crate::Result;
 
@@ -272,6 +273,12 @@ impl FileIOBuilder {
         self.config = self
             .config
             .with_props(args.into_iter().map(|e| (e.0.to_string(), e.1.to_string())));
+        self
+    }
+
+    /// Set the provider of the catalog bearer token, for storage that calls the catalog.
+    pub fn with_token_provider(mut self, provider: Arc<dyn TokenProvider>) -> Self {
+        self.config = self.config.with_token_provider(provider);
         self
     }
 

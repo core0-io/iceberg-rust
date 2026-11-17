@@ -296,7 +296,9 @@ impl StorageFactory for OpenDalStorageFactory {
                 Ok(Arc::new(OpenDalStorage::S3 {
                     config: s3_config.into(),
                     multipart_part_size: s3_multipart_part_size_parse(config.props())?,
-                    remote_signing,
+                    remote_signing: remote_signing.map(|signing| {
+                        signing.with_token_provider(config.token_provider().cloned())
+                    }),
                     customized_credential_load: customized_credential_load.clone(),
                     client_config: s3_client_config(config.props(), client_config)?,
                 }))

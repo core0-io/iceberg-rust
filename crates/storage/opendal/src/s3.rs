@@ -29,7 +29,7 @@ use iceberg::io::{
     S3_DISABLE_EC2_METADATA, S3_ENDPOINT, S3_MULTIPART_PART_SIZE_BYTES, S3_PATH_STYLE_ACCESS,
     S3_REGION, S3_REMOTE_SIGNING_CONFIG, S3_REMOTE_SIGNING_ENABLED, S3_RETRY_MAX_WAIT_MS,
     S3_RETRY_MIN_WAIT_MS, S3_RETRY_NUM_RETRIES, S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN,
-    S3_SIGNER_ENDPOINT, S3_SIGNER_URI, S3_SSE_KEY, S3_SSE_MD5, S3_SSE_TYPE,
+    S3_SIGNER_ENDPOINT, S3_SIGNER_URI, S3_SSE_KEY, S3_SSE_MD5, S3_SSE_TYPE, TokenProvider,
 };
 use iceberg::{Error, ErrorKind, Result};
 use iceberg_property_macro::Properties;
@@ -264,6 +264,7 @@ fn s3_remote_signing_parse(
         token: m.get(CATALOG_TOKEN).cloned(),
         properties: config.properties,
         headers: config.headers,
+        token_provider: None,
     }))
 }
 
@@ -328,6 +329,8 @@ pub struct S3RemoteSigning {
     properties: HashMap<String, String>,
     #[serde(default)]
     headers: HashMap<String, Vec<String>>,
+    #[serde(skip)]
+    token_provider: Option<Arc<dyn TokenProvider>>,
 }
 
 /// The REST catalog's `remote-signing-config`.
@@ -349,37 +352,41 @@ impl std::fmt::Debug for S3RemoteSigning {
 }
 
 impl S3RemoteSigning {
-    fn signer(&self, transport: HttpTransporter) -> Signer<SignerToken> {
+    /// Takes the signer's bearer token from `provider` on every signing call.
+    pub(crate) fn with_token_provider(mut self, provider: Option<Arc<dyn TokenProvider>>) -> Self {
+        self.token_provider = provider;
+        self
+    }
+
+    /// The provider's current token, else the one configured statically.
+    async fn token(&self) -> Option<String> {
+        match &self.token_provider {
+            Some(provider) => provider.token().await,
+            None => self.token.clone(),
+        }
+    }
+
+    fn signer(&self, transport: HttpTransporter) -> Signer<NoCredential> {
         let ctx = Context::new().with_http_send(transport);
-        Signer::new(
-            ctx,
-            SignerToken(self.token.clone()),
-            RemoteSigner(self.clone()),
-        )
+        Signer::new(ctx, NoCredential, RemoteSigner(self.clone()))
     }
 }
 
-/// Bearer token sent to the remote signer.
-#[derive(Clone)]
-struct SignerToken(Option<String>);
+/// The signer holds no credential of its own: the bearer token is fetched per request.
+#[derive(Clone, Debug)]
+struct NoCredential;
 
-impl std::fmt::Debug for SignerToken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("SignerToken")
-    }
-}
-
-impl SigningCredential for SignerToken {
+impl SigningCredential for NoCredential {
     fn is_valid(&self) -> bool {
         true
     }
 }
 
-impl ProvideCredential for SignerToken {
+impl ProvideCredential for NoCredential {
     type Credential = Self;
 
     async fn provide_credential(&self, _ctx: &Context) -> reqsign_core::Result<Option<Self>> {
-        Ok(Some(self.clone()))
+        Ok(Some(Self))
     }
 }
 
@@ -429,13 +436,13 @@ fn invalid_sign_response(e: impl Into<anyhow::Error>) -> reqsign_core::Error {
 struct RemoteSigner(S3RemoteSigning);
 
 impl SignRequest for RemoteSigner {
-    type Credential = SignerToken;
+    type Credential = NoCredential;
 
     async fn sign_request(
         &self,
         ctx: &Context,
         req: &mut http::request::Parts,
-        credential: Option<&SignerToken>,
+        _credential: Option<&NoCredential>,
         _expires_in: Option<Duration>,
     ) -> reqsign_core::Result<()> {
         let cache_key = (
@@ -447,7 +454,7 @@ impl SignRequest for RemoteSigner {
         let signed = match SIGNED_RESPONSES.get(&cache_key) {
             Some(signed) => signed,
             None => {
-                let signed = self.request_signature(ctx, req, credential).await?;
+                let signed = self.request_signature(ctx, req).await?;
                 if signed.is_cacheable() {
                     SIGNED_RESPONSES.insert(cache_key, signed.clone());
                 }
@@ -477,7 +484,6 @@ impl RemoteSigner {
         &self,
         ctx: &Context,
         req: &http::request::Parts,
-        credential: Option<&SignerToken>,
     ) -> reqsign_core::Result<S3SignResponse> {
         let mut headers: HashMap<&str, Vec<&str>> = HashMap::new();
         for (name, value) in &req.headers {
@@ -508,7 +514,7 @@ impl RemoteSigner {
                 sign_req = sign_req.header(name, value);
             }
         }
-        if let Some(token) = credential.and_then(|c| c.0.as_deref()) {
+        if let Some(token) = self.0.token().await {
             sign_req = sign_req.header(AUTHORIZATION, format!("Bearer {token}"));
         }
         let sign_req = sign_req.body(Bytes::from(body)).map_err(|e| {
@@ -532,7 +538,7 @@ impl RemoteSigner {
 
 /// Signs every outgoing request with the remote signer before handing it to `inner`.
 struct RemoteSigningTransport {
-    signer: Signer<SignerToken>,
+    signer: Signer<NoCredential>,
     inner: HttpTransporter,
 }
 
@@ -584,6 +590,7 @@ impl CustomAwsCredentialLoader {
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use http::HeaderValue;
@@ -591,7 +598,7 @@ mod tests {
     use iceberg::io::{
         FileIOBuilder, S3_ENDPOINT, S3_MULTIPART_PART_SIZE_BYTES, S3_PATH_STYLE_ACCESS,
         S3_REMOTE_SIGNING_CONFIG, S3_REMOTE_SIGNING_ENABLED, S3_RETRY_MAX_WAIT_MS,
-        S3_RETRY_MIN_WAIT_MS, S3_RETRY_NUM_RETRIES, S3_SIGNER_ENDPOINT,
+        S3_RETRY_MIN_WAIT_MS, S3_RETRY_NUM_RETRIES, S3_SIGNER_ENDPOINT, TokenProvider,
     };
     use opendal::layers::RetryLayer;
     use reqsign_core::{Context, SignRequest};
@@ -619,6 +626,7 @@ mod tests {
         let signer = RemoteSigner(S3RemoteSigning {
             properties: HashMap::new(),
             headers: HashMap::new(),
+            token_provider: None,
             signer_url: "http://127.0.0.1:1/v1/aws/s3/sign".to_string(),
             region: "us-east-1".to_string(),
             token: None,
@@ -825,6 +833,68 @@ mod tests {
         ]);
 
         assert!(s3_config_parse(props).is_err());
+    }
+
+    #[derive(Debug, Default)]
+    struct CountingTokens(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl TokenProvider for CountingTokens {
+        async fn token(&self) -> Option<String> {
+            Some(format!("t{}", self.0.fetch_add(1, Ordering::SeqCst) + 1))
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_signing_asks_the_token_provider_for_every_signature() {
+        let mut server = mockito::Server::new_async().await;
+        let url = server.url();
+        let mut signers = Vec::new();
+        for token in ["t1", "t2"] {
+            signers.push(
+                server
+                    .mock("POST", "/v1/aws/s3/sign")
+                    .match_header("authorization", format!("Bearer {token}").as_str())
+                    .with_body(
+                        serde_json::json!({ "uri": format!("{url}/bucket/key"), "headers": {} })
+                            .to_string(),
+                    )
+                    .expect(1)
+                    .create_async()
+                    .await,
+            );
+        }
+        let _object = server
+            .mock("GET", "/bucket/key")
+            .with_body("hello")
+            .expect(2)
+            .create_async()
+            .await;
+
+        let file_io = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::S3 {
+            customized_credential_load: None,
+        }))
+        .with_props([
+            (S3_ENDPOINT, url.as_str()),
+            (S3_PATH_STYLE_ACCESS, "true"),
+            (S3_REMOTE_SIGNING_ENABLED, "true"),
+            ("uri", url.as_str()),
+            ("token", "static"),
+        ])
+        .with_token_provider(Arc::new(CountingTokens::default()))
+        .build();
+        for _ in 0..2 {
+            file_io
+                .new_input("s3://bucket/key")
+                .unwrap()
+                .read()
+                .await
+                .unwrap();
+        }
+
+        for signer in signers {
+            signer.assert_async().await;
+        }
     }
 
     #[test]

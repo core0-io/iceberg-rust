@@ -30,6 +30,7 @@ use iceberg::encryption::kms::{KeyManagementClient, KmsClientFactory};
 use iceberg::io::{
     ADLS_SAS_TOKEN, FileIO, FileIOBuilder, GCS_TOKEN, S3_REMOTE_SIGNING_CONFIG,
     S3_REMOTE_SIGNING_ENABLED, S3_SESSION_TOKEN, S3_SIGNER_ENDPOINT, S3_SIGNER_URI, StorageFactory,
+    TokenProvider,
 };
 use iceberg::table::Table;
 use iceberg::{
@@ -77,7 +78,7 @@ pub const REST_CATALOG_PROP_AUTH_TYPE: &str = "rest.auth.type";
 /// to 100; 0 disables the cache). The cache is keyed by session id, so it only
 /// helps callers that reuse a [`SessionContext`], and a table changed through
 /// this catalog is invalidated only for the session that changed it. Loads that
-/// vend short-lived storage credentials or use S3 remote signing are never cached.
+/// vend short-lived storage credentials are never cached.
 pub const REST_CATALOG_PROP_TABLE_CACHE_MAX_ENTRIES: &str = "rest-table-cache.max-entries";
 /// How long a loaded table stays cached for freshness-aware loading, in
 /// milliseconds (defaults to 5 minutes; must be positive and at most 1000 years).
@@ -90,8 +91,7 @@ const TABLE_CACHE_EXPIRE_AFTER_WRITE_MS_DEFAULT: u64 = 5 * 60 * 1000;
 const TABLE_CACHE_EXPIRE_AFTER_WRITE_MAX: Duration = Duration::from_secs(1000 * 365 * 24 * 3600);
 
 /// Tables loaded with an `ETag`, keyed by session id and identifier. Loads that
-/// vend short-lived storage credentials or enable S3 remote signing (whose file
-/// IO carries the session's bearer token) are not cached, since a `304` cannot
+/// vend short-lived storage credentials are not cached, since a `304` cannot
 /// refresh them.
 type TableCache = moka::sync::Cache<(String, TableIdent), (String, Table)>;
 
@@ -105,6 +105,17 @@ fn remote_signing_enabled(props: &HashMap<String, String>) -> bool {
     props
         .get(S3_REMOTE_SIGNING_ENABLED)
         .is_some_and(|v| ["true", "t", "1", "on"].contains(&v.to_lowercase().as_str()))
+}
+
+/// Hands the S3 remote signer the session's current bearer token.
+#[derive(Debug)]
+struct SessionToken(Arc<dyn AuthSession>);
+
+#[async_trait]
+impl TokenProvider for SessionToken {
+    async fn token(&self) -> Option<String> {
+        self.0.token().await
+    }
 }
 
 /// The legacy, unprefixed spellings of [`S3_SIGNER_URI`] and [`S3_SIGNER_ENDPOINT`].
@@ -1053,7 +1064,7 @@ impl RestSessionCatalog {
 
     async fn load_file_io(
         &self,
-        session: &dyn AuthSession,
+        session: &Arc<dyn AuthSession>,
         metadata_location: Option<&str>,
         extra_config: Option<HashMap<String, String>>,
     ) -> Result<FileIO> {
@@ -1064,14 +1075,6 @@ impl RestSessionCatalog {
         if let Some(config) = extra_config {
             props.extend(config);
         }
-        // The S3 remote signer authenticates with the session's current token, which may
-        // have been obtained from a `credential` rather than configured directly.
-        if remote_signing_enabled(&props)
-            && let Some(token) = session.token().await
-        {
-            props.insert("token".to_string(), token);
-        }
-
         // If the warehouse is a logical identifier instead of a URL we don't want
         // to raise an exception
         let warehouse_path = match self.client().await?.config.warehouse.as_deref() {
@@ -1098,9 +1101,14 @@ impl RestSessionCatalog {
                 )
             })?;
 
-        let file_io = FileIOBuilder::new(factory).with_props(props).build();
+        let remote_signing = remote_signing_enabled(&props);
+        let mut builder = FileIOBuilder::new(factory).with_props(props);
+        if remote_signing {
+            // The signer asks for the token on each request, so it follows refreshes.
+            builder = builder.with_token_provider(Arc::new(SessionToken(Arc::clone(session))));
+        }
 
-        Ok(file_io)
+        Ok(builder.build())
     }
 }
 
@@ -1423,7 +1431,7 @@ impl SessionCatalog for RestSessionCatalog {
         )?;
 
         let file_io = self
-            .load_file_io(session.as_ref(), Some(metadata_location), Some(config))
+            .load_file_io(&session, Some(metadata_location), Some(config))
             .await?;
 
         let mut table_builder = Table::builder()
@@ -1520,11 +1528,10 @@ impl SessionCatalog for RestSessionCatalog {
             response.remote_signing_config,
             &self.user_config.props,
         )?;
-        let cacheable = !vends_credentials && !remote_signing_enabled(&config);
 
         let file_io = self
             .load_file_io(
-                session.as_ref(),
+                &session,
                 response.metadata_location.as_deref(),
                 Some(config),
             )
@@ -1549,7 +1556,7 @@ impl SessionCatalog for RestSessionCatalog {
         // the next load's `If-None-Match` check replaces it.
         if let Some((cache, key)) = cache {
             match etag {
-                Some(etag) if cacheable => cache.insert(key, (etag, table.clone())),
+                Some(etag) if !vends_credentials => cache.insert(key, (etag, table.clone())),
                 _ => cache.invalidate(&key),
             }
         }
@@ -1679,7 +1686,7 @@ impl SessionCatalog for RestSessionCatalog {
         ))?;
 
         let file_io = self
-            .load_file_io(session.as_ref(), Some(metadata_location), None)
+            .load_file_io(&session, Some(metadata_location), None)
             .await?;
 
         let mut table_builder = Table::builder()
@@ -1760,7 +1767,7 @@ impl SessionCatalog for RestSessionCatalog {
         };
 
         let file_io = self
-            .load_file_io(session.as_ref(), Some(&response.metadata_location), None)
+            .load_file_io(&session, Some(&response.metadata_location), None)
             .await?;
 
         let mut table_builder = Table::builder()
@@ -4858,20 +4865,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_load_table_with_remote_signing_is_not_cached() {
+    async fn test_load_table_with_remote_signing_is_revalidated() {
         let mut server = Server::new_async().await;
         let _config = create_config_mock(&mut server).await;
         let mut body = load_table_body("v1");
         body["config"] = json!({ S3_REMOTE_SIGNING_ENABLED: "true" });
-        let load = server
+        let _load = server
             .mock("GET", "/v1/namespaces/ns1/tables/test1")
             .match_header("if-none-match", Matcher::Missing)
             .with_status(200)
             .with_header("etag", "\"v1\"")
             .with_body(body.to_string())
-            .expect(2)
             .create_async()
             .await;
+        let revalidate = load_table_mock(&mut server, "\"v1\"".into(), 304, None).await;
         let catalog = session_catalog(RestCatalogConfig::builder().uri(server.url()).build());
         let context = SessionContext::empty();
 
@@ -4882,7 +4889,7 @@ mod tests {
                 .unwrap();
         }
 
-        load.assert_async().await;
+        revalidate.assert_async().await;
     }
 
     async fn load_table_signer_props(
@@ -5013,22 +5020,13 @@ mod tests {
         load.assert_async().await;
     }
 
-    async fn load_table_file_io_props_with_oauth(
-        remote_signing: bool,
-    ) -> (String, HashMap<String, String>) {
+    async fn load_table_file_io_with_oauth(remote_signing: bool) -> FileIO {
         let mut server = Server::new_async().await;
         let oauth_mock = create_oauth_mock(&mut server).await;
         let config_mock = create_config_mock(&mut server).await;
-        let mut body: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(format!(
-                "{}/testdata/load_table_response.json",
-                env!("CARGO_MANIFEST_DIR")
-            ))
-            .unwrap(),
-        )
-        .unwrap();
+        let mut body = load_table_body("v1");
         if remote_signing {
-            body["config"][S3_REMOTE_SIGNING_ENABLED] = "true".into();
+            body["config"] = json!({ S3_REMOTE_SIGNING_ENABLED: "true" });
         }
         let load_table_mock = server
             .mock("GET", "/v1/namespaces/ns1/tables/test1")
@@ -5048,35 +5046,30 @@ mod tests {
                 .build(),
         );
         let table = catalog
-            .load_table(
-                &SessionContext::empty(),
-                &TableIdent::new(NamespaceIdent::new("ns1".to_string()), "test1".to_string()),
-            )
+            .load_table(&SessionContext::empty(), &test_table_ident())
             .await
             .unwrap();
 
         oauth_mock.assert_async().await;
         config_mock.assert_async().await;
         load_table_mock.assert_async().await;
-        (server.url(), table.file_io().config().props().clone())
+        table.file_io().clone()
     }
 
     #[tokio::test]
-    async fn test_load_table_remote_signing_file_io_carries_session_token() {
-        let (url, props) = load_table_file_io_props_with_oauth(true).await;
+    async fn test_load_table_remote_signing_file_io_provides_session_token() {
+        let file_io = load_table_file_io_with_oauth(true).await;
 
-        assert_eq!(
-            props.get("token").map(String::as_str),
-            Some("ey000000000000")
-        );
-        assert_eq!(props.get(REST_CATALOG_PROP_URI), Some(&url));
+        let provider = file_io.config().token_provider().unwrap();
+        assert_eq!(provider.token().await.as_deref(), Some("ey000000000000"));
+        assert!(file_io.config().props().contains_key(REST_CATALOG_PROP_URI));
     }
 
     #[tokio::test]
-    async fn test_load_table_file_io_omits_session_token_without_remote_signing() {
-        let (_, props) = load_table_file_io_props_with_oauth(false).await;
+    async fn test_load_table_file_io_has_no_token_provider_without_remote_signing() {
+        let file_io = load_table_file_io_with_oauth(false).await;
 
-        assert_eq!(props.get("token"), None);
+        assert!(file_io.config().token_provider().is_none());
     }
 
     #[tokio::test]
